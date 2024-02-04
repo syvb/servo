@@ -2,17 +2,19 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::collections::VecDeque;
 use std::convert::TryFrom;
 use std::io;
 
 use devtools_traits::{ConsoleMessage, LogLevel, ScriptToDevtoolsControlMsg};
-use js::jsapi::{self, ESClass, PropertyDescriptor};
-use js::jsval::UndefinedValue;
+use js::jsapi::{self, ESClass, Heap, JSTracer, PropertyDescriptor};
+use js::jsval::{JSVal, UndefinedValue};
 use js::rust::wrappers::{
     GetBuiltinClass, GetPropertyKeys, JS_GetOwnPropertyDescriptorById, JS_GetPropertyById,
     JS_IdToValue, JS_ValueToSource,
 };
-use js::rust::{describe_scripted_caller, HandleValue, IdVector};
+use js::rust::{describe_scripted_caller, HandleValue, IdVector, RootedGuard, RootedTraceableBox, RootedTraceableSet, Trace};
+use js::gc::Traceable;
 
 use crate::dom::bindings::conversions::jsstring_to_str;
 use crate::dom::bindings::inheritance::Castable;
@@ -68,121 +70,160 @@ where
 }
 
 #[allow(unsafe_code)]
-unsafe fn handle_value_to_string(cx: *mut jsapi::JSContext, value: HandleValue) -> DOMString {
+unsafe fn handle_value_to_string(cx: *mut jsapi::JSContext, value: HandleValue) -> String {
     rooted!(in(cx) let mut js_string = std::ptr::null_mut::<jsapi::JSString>());
     js_string.set(JS_ValueToSource(cx, value));
-    return jsstring_to_str(cx, *js_string);
+    return jsstring_to_str(cx, *js_string).to_string();
 }
 
 #[allow(unsafe_code)]
-fn stringify_handle_value(message: HandleValue) -> DOMString {
-    let cx = *GlobalScope::get_cx();
-    unsafe {
-        if message.is_string() {
-            return jsstring_to_str(cx, message.to_string());
+fn stringify_handle_value(value: HandleValue) -> DOMString {
+    struct ValueInfo {
+        key: Option<String>,
+        value: Box<Heap<JSVal>>,
+        object_class: Option<ESClass>,
+    }
+    unsafe impl Trace for ValueInfo {
+        unsafe fn trace(&self, trc: *mut JSTracer) {
+            self.value.trace(trc);
         }
-        unsafe fn stringify_object_from_handle_value(
-            cx: *mut jsapi::JSContext,
-            value: HandleValue,
-            parents: Vec<u64>,
-        ) -> DOMString {
-            rooted!(in(cx) let mut obj = value.to_object());
-            let mut object_class = ESClass::Other;
-            if !GetBuiltinClass(cx, obj.handle().into(), &mut object_class as *mut _) {
-                return DOMString::from("/* invalid */");
-            }
-            if object_class != ESClass::Array && object_class != ESClass::Object {
-                return handle_value_to_string(cx, value);
-            }
+    }
 
-            let mut ids = IdVector::new(cx);
-            if !GetPropertyKeys(
-                cx,
-                obj.handle().into(),
-                jsapi::JSITER_OWNONLY | jsapi::JSITER_SYMBOLS,
-                ids.handle_mut(),
-            ) {
-                return DOMString::from("/* invalid */");
-            }
-            let mut explicit_keys = object_class == ESClass::Object;
-            let mut props = Vec::with_capacity(ids.len());
-            for id in &*ids {
-                rooted!(in(cx) let id = *id);
-                rooted!(in(cx) let mut desc = PropertyDescriptor::default());
+    unsafe {
+        let cx = *GlobalScope::get_cx();
+        if value.is_string() {
+            return jsstring_to_str(cx, value.to_string());
+        }
 
-                let mut is_none = false;
-                if !JS_GetOwnPropertyDescriptorById(
-                    cx,
-                    obj.handle().into(),
-                    id.handle().into(),
-                    desc.handle_mut().into(),
-                    &mut is_none,
-                ) {
-                    return DOMString::from("/* invalid */");
-                }
-
-                rooted!(in(cx) let mut property = UndefinedValue());
-                if !JS_GetPropertyById(cx, obj.handle(), id.handle(), property.handle_mut())
-                {
-                    return DOMString::from("/* invalid */");
-                }
-
-                if !explicit_keys {
-                    if id.is_int() {
-                        if let Ok(id_int) = usize::try_from(id.to_int()) {
-                            explicit_keys = props.len() != id_int;
-                        } else {
-                            explicit_keys = false;
+        let mut parents = vec![VecDeque::new()];
+        parents[0].push_back(ValueInfo {
+            value: Heap::boxed(*value),
+            key: None,
+            object_class: None,
+        });
+        let mut str = String::new();
+        'outer: loop {
+            let current_value = parents.last().unwrap().back().unwrap();
+            if parents.len() >= MAX_LOG_DEPTH {
+                parents.last().unwrap().pop_back();
+                str.push_str("...");
+            } else if current_value.value.get().is_undefined() {
+                parents.last().unwrap().pop_back();
+                // This produces a better value than "(void 0)" from JS_ValueToSource.
+                str.push_str("undefined");
+            } else if !current_value.value.get().is_object() {
+                parents.last().unwrap().pop_back();
+                str.push_str(&handle_value_to_string(cx, current_value.value.get()));
+            } else if parents.iter().find(|parent| parent[0].value.get().asBits_ == current_value.value.get().asBits_).is_some() {
+                parents.last().unwrap().pop_back();
+                str.push_str("[circular]");
+            } else {
+                let mut current_value = parents.last_mut().unwrap().back_mut().unwrap();
+                rooted!(in(cx) let mut obj = current_value.value.get().to_object());
+                let (str_text, children) = (|| {
+                    let mut object_class = ESClass::Other;
+                    if !GetBuiltinClass(cx, obj.handle().into(), &mut object_class as *mut _) {
+                        return ("/* invalid */".to_string(), VecDeque::new());
+                    }
+                    if object_class != ESClass::Array && object_class != ESClass::Object {
+                        return (handle_value_to_string(cx, current_value.value.get()), VecDeque::new());
+                    }
+                    current_value.object_class = Some(object_class);
+        
+                    let mut ids = IdVector::new(cx);
+                    if !GetPropertyKeys(
+                        cx,
+                        obj.handle().into(),
+                        jsapi::JSITER_OWNONLY | jsapi::JSITER_SYMBOLS,
+                        ids.handle_mut(),
+                    ) {
+                        return ("/* invalid */".to_string(), VecDeque::new());
+                    }
+                    let mut explicit_keys = object_class == ESClass::Object;
+                    let mut props = VecDeque::with_capacity(ids.len());
+                    for id in &*ids {
+                        rooted!(in(cx) let id = *id);
+                        rooted!(in(cx) let mut desc = PropertyDescriptor::default());
+        
+                        let mut is_none = false;
+                        if !JS_GetOwnPropertyDescriptorById(
+                            cx,
+                            obj.handle().into(),
+                            id.handle().into(),
+                            desc.handle_mut().into(),
+                            &mut is_none,
+                        ) {
+                            return ("/* invalid */".to_string(), VecDeque::new());
                         }
+        
+                        rooted!(in(cx) let mut property = UndefinedValue());
+                        if !JS_GetPropertyById(cx, obj.handle(), id.handle(), property.handle_mut())
+                        {
+                            return ("/* invalid */".to_string(), VecDeque::new());
+                        }
+        
+                        if !explicit_keys {
+                            if id.is_int() {
+                                if let Ok(id_int) = usize::try_from(id.to_int()) {
+                                    explicit_keys = props.len() != id_int;
+                                } else {
+                                    explicit_keys = false;
+                                }
+                            } else {
+                                explicit_keys = false;
+                            }
+                        }
+                        let key = if explicit_keys {
+                            if id.is_string() || id.is_symbol() || id.is_int() {
+                                rooted!(in(cx) let mut key_value = UndefinedValue());
+                                let raw_id: jsapi::HandleId = id.handle().into();
+                                if !JS_IdToValue(cx, *raw_id.ptr, key_value.handle_mut()) {
+                                    return ("/* invalid */".to_string(), VecDeque::new());
+                                }
+                                Some(handle_value_to_string(cx, key_value.handle()))
+                            } else {
+                                return ("/* invalid */".to_string(), VecDeque::new());
+                            }
+                        } else {
+                            None
+                        };
+                        props.push_back(ValueInfo {
+                            key,
+                            value: property.handle(),
+                            object_class: Some(object_class),
+                        });
+                    }
+                    let opener = if object_class == ESClass::Array {
+                        "[".to_string()
                     } else {
-                        explicit_keys = false;
+                        "{".to_string()
+                    };
+                    (opener, props)
+                })();
+                parents.push(children);
+            };
+            loop {
+                let last_parent = if let Some(last_parent) = parents.last_mut() {
+                    last_parent
+                } else {
+                    break 'outer;
+                };
+                if last_parent.is_empty() {
+                    parents.pop();
+                    if let Some(last_parent) = parents.last_mut() {
+                        let finished_object = last_parent.pop_front().unwrap();
+                        str.push(match finished_object.object_class {
+                            Some(ESClass::Array) => ']',
+                            Some(_) => '}',
+                            None => unreachable!(),
+                        });
+                    } else {
+                        break 'outer;
                     }
                 }
-                let value_string = stringify_inner(cx, property.handle(), parents.clone());
-                if explicit_keys {
-                    let key = if id.is_string() || id.is_symbol() || id.is_int() {
-                        rooted!(in(cx) let mut key_value = UndefinedValue());
-                        let raw_id: jsapi::HandleId = id.handle().into();
-                        if !JS_IdToValue(cx, *raw_id.ptr, key_value.handle_mut()) {
-                            return DOMString::from("/* invalid */");
-                        }
-                        handle_value_to_string(cx, key_value.handle())
-                    } else {
-                        return DOMString::from("/* invalid */");
-                    };
-                    props.push(format!("{}: {}", key, value_string,));
-                } else {
-                    props.push(value_string.to_string());
-                }
-            }
-            if object_class == ESClass::Array {
-                DOMString::from(format!("[{}]", itertools::join(props, ", ")))
-            } else {
-                DOMString::from(format!("{{{}}}", itertools::join(props, ", ")))
             }
         }
-        unsafe fn stringify_inner(
-            cx: *mut jsapi::JSContext,
-            value: HandleValue,
-            mut parents: Vec<u64>,
-        ) -> DOMString {
-            if parents.len() >= MAX_LOG_DEPTH {
-                return DOMString::from("...");
-            }
-            let value_bits = value.asBits_;
-            if parents.contains(&value_bits) {
-                return DOMString::from("[circular]");
-            }
-            if value.is_undefined() {
-                // This produces a better value than "(void 0)" from JS_ValueToSource.
-                return DOMString::from("undefined");
-            } else if !value.is_object() {
-                return handle_value_to_string(cx, value);
-            }
-            parents.push(value_bits);
-            stringify_object_from_handle_value(cx, value, parents)
-        }
-        stringify_inner(cx, message.into(), Vec::new())
+        DOMString::from(str)
     }
 }
 
