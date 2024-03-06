@@ -10,6 +10,8 @@ interface WorkerGlobalScope : GlobalScope {
 
   //void close();
   attribute OnErrorEventHandler onerror;
+  attribute EventHandler onrejectionhandled;
+  attribute EventHandler onunhandledrejection;
   //         attribute EventHandler onlanguagechange;
   //         attribute EventHandler onoffline;
   //         attribute EventHandler ononline;

@@ -249,6 +249,19 @@ impl WorkerGlobalScopeMethods for WorkerGlobalScope {
     // https://html.spec.whatwg.org/multipage/#handler-workerglobalscope-onerror
     error_event_handler!(error, GetOnerror, SetOnerror);
 
+    // https://html.spec.whatwg.org/multipage/#the-workerglobalscope-common-interface:event-onrejectionhandled
+    event_handler!(
+        rejectionhandled,
+        GetOnrejectionhandled,
+        SetOnrejectionhandled
+    );
+    // https://html.spec.whatwg.org/multipage/#the-workerglobalscope-common-interface:event-unhandledrejection
+    event_handler!(
+        unhandledrejection,
+        GetOnunhandledrejection,
+        SetOnunhandledrejection
+    );
+
     // https://html.spec.whatwg.org/multipage/#dom-workerglobalscope-importscripts
     fn ImportScripts(&self, url_strings: Vec<DOMString>) -> ErrorResult {
         let mut urls = Vec::with_capacity(url_strings.len());
